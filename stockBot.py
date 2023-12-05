@@ -3,55 +3,67 @@
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.stream import TradingStream
 import numpy as np
+import websockets
+import json
+import ast
+import time
+import asyncio
+from tqdm import tqdm
 
 # The global variables everything else needs
 SEC_KEY = 'erU539BdUUsStoJCLuJANSgI6cI8TEYj9gcZbpRd'  # Enter Your Secret Key Here
 PUB_KEY = 'PKZBJS2I4QCXLGEI9V5T'  # Enter Your Public Key Here
 BASE_URL = 'https://paper-api.alpaca.markets'  # This is the base URL for paper trading
-client = TradingClient(key_id=PUB_KEY, secret_key=SEC_KEY, paper=True)  # This is the client object
-account = dict(client.get_account())  #This is the account object
+client = TradingClient(PUB_KEY, secret_key=SEC_KEY, paper=True)  # This is the client object
+account = dict(client.get_account())  # This is the account object
 
 
-def getAccountData():
-    # This funtion will return the account data
-    assets = [i for i in client.get_all_positions]
-    positions = [(asset.symbol, asset.qty, asset.current_price) for asset in assets]
-    return positions
+def stringToDictionary(string):
+    newList = ast.literal_eval(string)
+    return newList[0]
 
 
-def getPosition(ticker):
-    # This function will return the position of the stock
-    # ticker is the ticker of the stock
-    positions = getAccountData()
-    for position in positions:
-        if position[0] == ticker:
-            return position[1]
+def getQuantity(ticker):
+    # Get a list of all of our positions.
+    portfolio = client.get_all_positions()
+    # Print the quantity of shares for each position.
+    for position in portfolio:
+        qty, symbol = position.qty, position.symbol
+        if symbol == ticker:
+            return qty, position.avg_entry_price
 
-    return 0
+    return 0, 0
+
+def subscriptionMessage(ticker, unsubscribe=False):
+    subscription = "subscribe" if not unsubscribe else "unsubscribe"
+    return {"action": "subscribe",
+            "trades": [ticker],
+            "bars": [ticker]}
 
 
-def manageStock(ticker, order):
+def manageStock(ticker, order, qty=1):
     # This function will manage the stock account
     # ticker is the ticker of the stock
 
-    if order == "hold":
-        return
-    elif order == "buy":
+    if order == "buy":
         orderDetails = MarketOrderRequest(
             symbol=ticker,
-            qty=1,
+            qty=qty,
             side=OrderSide.BUY,
             type=OrderType.MARKET,
+            time_in_force=TimeInForce.DAY
         )
     elif order == "sell":
         orderDetails = MarketOrderRequest(
             symbol=ticker,
-            qty=1,
+            qty=qty,
             side=OrderSide.SELL,
             type=OrderType.MARKET,
+            time_in_force=TimeInForce.DAY
         )
+    else:
+        return 0
 
     client.submit_order(order_data=orderDetails)
 
@@ -59,35 +71,94 @@ def manageStock(ticker, order):
 def closeEverything():
     client.close_all_positions()
 
-def getMarketData(ticker):
-    # This function will return the market data of the stock
-    # ticker is the ticker of the stock
-    return api.get_barset(ticker, 'minute', limit=5)
+
+# NOTE: This code can take multiple minutes to run
+# It also returns two dictionaries, one for general data and one for bars data
+async def getMarketData(ticker):
+    url = "wss://stream.data.alpaca.markets/v2/iex"
+
+    auth_message = {
+        "action": "auth",
+        "key": PUB_KEY,
+        "secret": SEC_KEY
+    }
+
+    async with websockets.connect(url) as ws:
+        # First, connect to the websocket
+        if stringToDictionary(await ws.recv())["msg"] == "connected":
+            await ws.send(json.dumps(auth_message))
+
+            # Then, authenticate
+            if stringToDictionary(await ws.recv())["msg"] == "authenticated":
+
+                # Then, subscribe to the ticker
+                await ws.send(json.dumps(subscriptionMessage(ticker)))
+                await ws.recv()
+
+                # Now just wait for something to come in and return it
+                while True:
+                    hasBars = False
+                    hasGeneral = False
+                    general = []
+                    bars = []
+
+                    while not hasBars or not hasGeneral:
+                        message = await ws.recv()
+                        tempMessage = stringToDictionary(message)
+                        if tempMessage["T"] == "b":
+                            hasBars = True
+                            bars = message
+                        elif tempMessage["T"] == "t":
+                            hasGeneral = True
+                            general = message
+
+                    generalDict = stringToDictionary(general)
+                    barsDict = stringToDictionary(bars)
+
+                    return generalDict, barsDict
 
 
-def mainLogic(ticker):
-    market_data = getMarketData(ticker)
-    pos_held = getPosition(
-        ticker)  # This will return 0 if the stock is not in the portfolio, else it will return the position
+async def mainLogic(ticker):
+    marketData, marketBars = await getMarketData(ticker)
+    quantity, purchasePrice = getQuantity(ticker)  # This will return 0 if the stock is not in the portfolio
 
-    close_list = []  # This array will store all the closing prices from the last 5 minutes
-    for bar in market_data[ticker]:
-        close_list.append(bar.c)  # bar.c is the closing price of that bar's time interval
+    print(quantity, purchasePrice)
 
-    close_list = np.array(close_list, dtype=np.float64)  # Convert to numpy array
-    ma = np.mean(close_list)
-    last_price = close_list[4]  # Most recent closing price
+    positionHeld = True if quantity != 0 else False
 
-    if ma + 0.1 < last_price and not pos_held:  # If MA is more than 10cents under price, and we haven't already bought
+    print(positionHeld)
+
+    closeList = [marketBars["c"]]  # This array will store all the closing prices from the last 5 minutes
+
+    for i in tqdm(range(4)):
+        marketData, newBars = await getMarketData(ticker)
+        closeList.append(newBars["c"])
+
+    print(closeList)
+
+    closeList = np.array(closeList, dtype=np.float64)  # Convert to numpy array
+    ma = np.mean(closeList)
+    lastPrice = marketData['p']  # Most recent closing price
+
+    if ma + 0.1 < lastPrice and not positionHeld:  # If MA is more than 10cents under price, and we haven't bought
         return "buy"
-    elif ma - 0.1 > last_price and pos_held:  # If MA is more than 10cents above price, and we already bought
+    elif ma - 0.1 > lastPrice and positionHeld:  # If MA is more than 10cents above price, and we already bought
         return "sell"
     else:
         return "hold"
 
 
-def mainProgram():
-    manageStock("SPY", mainLogic("SPY"))
+def mainProgram(stocks):
+    for ticker in stocks:
+        manageStock(ticker, asyncio.run(mainLogic("SPY")), int(getQuantity(ticker)[0]))
 
 
-mainProgram()
+# price, bars = asyncio.run(getMarketData("AAPL"))
+# print(price,bars)
+#
+# print(account)
+#
+# Get our position in AAPL.
+# aapl_position = client.get_open_position('AAPL').avg_entry_price # This tells us how much we paid for something
+
+print(asyncio.run(mainLogic("AAPL")))

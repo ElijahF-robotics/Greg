@@ -3,9 +3,15 @@
 
 import stockBot
 import time
+import asyncio
 
 
-def main():
+async def stockBotMain(stocks):
+    stockBot.mainProgram(stocks)
+    time.sleep(60)
+
+
+async def main():
     input("Would you like to access Greg? (Press enter to continue)")
     print("/n/n/n")
 
@@ -17,16 +23,7 @@ def main():
     print()
     ans = input(">")
 
-    if ans == "s":
-        while True:
-            stockBot.mainProgram()
-            ans = input("Would you like to continue? (y/n)")
-            if ans == "n":
-                break
-            else:
-                continue
-
-    elif ans == "a":
+    if ans == "a":
         while True:
             stockBot.mainProgram()
             time.sleep(60)
@@ -37,3 +34,5 @@ def main():
     else:
         print("Invalid input. Please try again")
         main()
+
+asyncio.run(main())
